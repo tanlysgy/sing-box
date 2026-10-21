@@ -150,10 +150,12 @@ jobs:
           root = pathlib.Path(".")
           def count(d):
               p = root / d
-              return len([x for x in p.rglob("*.md")]) if p.is_dir() else -1
+              if not p.is_dir():
+                  return -1
+              return len([x for x in p.rglob("*.md") if "node_modules" not in x.parts])
 
           cands = ["docs", "doc", "documentation", "website/docs", "website/content",
-                   "content", "site/docs", "wiki", "manual"]
+                   "content", "site/docs", "wiki", "manual", "handbook"]
           extra = [str(p.relative_to(root)) for p in root.glob("*/docs") if p.is_dir()]
           extra += [str(p.relative_to(root)) for p in root.glob("*/*/docs") if p.is_dir()]
           best, best_n = None, 0
@@ -162,41 +164,68 @@ jobs:
               if n > best_n:
                   best, best_n = c, n
 
-          if best is None:
-              # last resort: single page site made from top-level markdown
-              stage = root / "_atlas_docs"
-              stage.mkdir(exist_ok=True)
-              picked = 0
-              for name in ("README.md", "readme.md", "README.rst", "CONTRIBUTING.md",
-                           "docs.md", "USAGE.md", "INSTALL.md", "CHANGELOG.md"):
-                  src = root / name
-                  if src.is_file() and src.suffix == ".md":
-                      shutil.copy(src, stage / ("index.md" if picked == 0 else name))
-                      picked += 1
-              if picked == 0:
-                  print("::warning::no markdown found, publishing a placeholder page")
-                  (stage / "index.md").write_text(
-                      "# Documentation mirror\n\nThis project keeps its documentation "
-                      "outside the repository. See the upstream project site.\n",
-                      encoding="utf-8")
-              best, best_n = "_atlas_docs", 1
+          stage = root / "_atlas_docs_src"
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir()
 
-          print("docs dir:", best, "markdown files:", best_n, file=sys.stderr)
+          picked = 0
+          if best is not None:
+              src = root / best
+              for p in src.rglob("*"):
+                  if not p.is_file():
+                      continue
+                  rel = p.relative_to(src)
+                  if "node_modules" in rel.parts or any(part.startswith(".") for part in rel.parts):
+                      continue
+                  dst = stage / rel
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  try:
+                      shutil.copy(p, dst)
+                      picked += 1
+                  except OSError:
+                      pass
+          if picked == 0:
+              for name in ("README.md", "readme.md", "CONTRIBUTING.md", "USAGE.md",
+                           "INSTALL.md", "docs.md", "CHANGELOG.md"):
+                  f = root / name
+                  if f.is_file() and f.suffix == ".md":
+                      shutil.copy(f, stage / ("index.md" if picked == 0 else name))
+                      picked += 1
+
           entries = []
-          for p in sorted((root / best).rglob("*.md")):
-              rel = p.relative_to(root / best).as_posix()
-              if any(part.startswith(".") or part == "node_modules" for part in rel.split("/")):
-                  continue
+          for p in sorted(stage.rglob("*.md")):
+              rel = p.relative_to(stage).as_posix()
               title = p.stem.replace("-", " ").replace("_", " ").strip().title() or "Index"
               entries.append((rel, title))
           if not entries:
-              (root / best / "index.md").write_text("# Documentation mirror\n", encoding="utf-8")
+              (stage / "index.md").write_text("# Documentation mirror\n", encoding="utf-8")
               entries = [("index.md", "Index")]
           entries.sort(key=lambda it: (0 if it[0].lower() == "index.md" else 1, it[0]))
 
+          has_index = any(e[0].lower() in ("index.md", "readme.md") for e in entries)
+          if not has_index:
+              lines = ["# Documentation index", "",
+                       "This is an Atlas mirror of the upstream project documentation.", ""]
+              groups = {}
+              for rel, title in entries:
+                  top = rel.split("/")[0] if "/" in rel else ""
+                  groups.setdefault(top, []).append((rel, title))
+              for top in sorted(groups):
+                  if top:
+                      lines += ["## %s" % top.replace("-", " ").replace("_", " ").title(), ""]
+                  for rel, title in groups[top]:
+                      lines.append("- [%s](%s)" % (title, rel))
+                  lines.append("")
+              (stage / "index.md").write_text("\n".join(lines), encoding="utf-8")
+              entries.insert(0, ("index.md", "Index"))
+              has_index = True
+
+          print("docs source:", best, "copied:", picked, "pages:", len(entries), file=sys.stderr)
+
           cfg = [
               "site_name: Atlas docs mirror",
-              "docs_dir: %s" % best,
+              "docs_dir: _atlas_docs_src",
               "use_directory_urls: true",
               "theme:", "  name: material",
               "  features:", "    - navigation.top", "    - navigation.sections",
@@ -210,14 +239,50 @@ jobs:
               "  - pymdownx.tasklist", "  - pymdownx.tilde", "  - pymdownx.caret",
               "nav:",
           ]
-          if len(entries) > 1:
-              cfg += ["  - %s: %s" % (t.replace(":", " -").replace("#", ""), r)
-                      for r, t in entries[:800]]
+          # keep nav shallow: group by top-level directory
+          grouped, order = {}, []
+          for rel, title in entries:
+              key = rel.split("/")[0] if "/" in rel else ""
+              if key not in grouped:
+                  grouped[key] = []
+                  order.append(key)
+              grouped[key].append((rel, title))
+          if len(entries) == 1:
+              cfg.append("  - Home: %s" % entries[0][0])
           else:
-              cfg += ["  - Home: %s" % entries[0][0]]
+              for key in order:
+                  items = grouped[key][:200]
+                  if key == "":
+                      cfg += ["  - %s: %s" % (t.replace(":", " -").replace("#", ""), r) for r, t in items]
+                  else:
+                      label = key.replace("-", " ").replace("_", " ").strip().title()
+                      cfg.append("  - %s:" % label.replace(":", " -"))
+                      cfg += ["      - %s: %s" % (t.replace(":", " -").replace("#", ""), r) for r, t in items]
           pathlib.Path("mkdocs.atlas.yml").write_text("\n".join(cfg) + "\n", encoding="utf-8")
           PY
           mkdocs build -f mkdocs.atlas.yml -d _atlas_site
+      - name: Ensure index.html exists
+        run: |
+          if [ -f _atlas_site/index.html ]; then exit 0; fi
+          echo "::warning::no index.html produced, generating a landing page"
+          python3 - <<'PY'
+          import pathlib
+          site = pathlib.Path("_atlas_site")
+          site.mkdir(exist_ok=True)
+          pages = sorted(p.relative_to(site).as_posix() for p in site.rglob("*.html"))
+          links = "\n".join('- [%s](%s)' % (p, p) for p in pages[:500])
+          if not links:
+              links = "- (no pages were produced by this build)"
+          site.joinpath("index.html").write_text(
+              "<!doctype html><html><head><meta charset='utf-8'>"
+              "<title>Atlas docs mirror</title>"
+              "<style>body{font-family:system-ui;max-width:52rem;margin:3rem auto;padding:0 1rem;"
+              "line-height:1.6}a{color:#0b6}</style></head><body>"
+              "<h1>Atlas docs mirror</h1><p>Upstream documentation pages produced by this build:</p>"
+              "<ul>" + "".join("<li><a href='%s'>%s</a></li>" % (p, p) for p in pages[:500]) +
+              "</ul></body></html>", encoding="utf-8")
+          print("generated landing page with", len(pages), "links")
+          PY
       - name: Add .nojekyll
         run: touch _atlas_site/.nojekyll
       - uses: actions/configure-pages@v5
